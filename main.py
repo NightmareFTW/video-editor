@@ -9,6 +9,7 @@ Exemplos:
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import shutil
 import subprocess
@@ -82,18 +83,74 @@ def has_audio_stream(video_path: Path, ffmpeg_binary: str) -> bool:
     return re.search(r"Stream #\d+:\d+.*Audio:", combined_output) is not None
 
 
+def resolve_ffprobe_binary(ffmpeg_binary: str) -> str:
+    ffprobe_in_path = shutil.which("ffprobe")
+    if ffprobe_in_path:
+        return ffprobe_in_path
+
+    ffmpeg_path = Path(ffmpeg_binary)
+    sibling_ffprobe = ffmpeg_path.with_name("ffprobe")
+    if sibling_ffprobe.exists():
+        return str(sibling_ffprobe)
+
+    if ffmpeg_path.suffix:
+        sibling_ffprobe_with_suffix = ffmpeg_path.with_name(f"ffprobe{ffmpeg_path.suffix}")
+        if sibling_ffprobe_with_suffix.exists():
+            return str(sibling_ffprobe_with_suffix)
+
+    raise RuntimeError("ffprobe não encontrado. Instale FFmpeg completo (ffmpeg + ffprobe).")
+
+
+def get_video_duration_seconds(video_path: Path, ffprobe_binary: str) -> float:
+    cmd = [
+        ffprobe_binary,
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "json",
+        str(video_path),
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    payload = json.loads(result.stdout or "{}")
+    duration_raw = payload.get("format", {}).get("duration")
+
+    if duration_raw is None:
+        raise RuntimeError("Não foi possível obter a duração do vídeo de entrada.")
+
+    duration = float(duration_raw)
+    if duration <= 0:
+        raise RuntimeError("A duração do vídeo é inválida (<= 0).")
+    return duration
+
+
+def compute_trim_window(video_duration_seconds: float) -> tuple[float, float]:
+    start = min(START_SECOND, max(video_duration_seconds - 0.001, 0.0))
+    end = min(END_SECOND, video_duration_seconds)
+
+    if end <= start:
+        start = 0.0
+        end = video_duration_seconds
+
+    return start, end
+
+
 def build_ffmpeg_command(
     ffmpeg_binary: str,
     input_video: Path,
     logo: Path,
     output_video: Path,
     include_audio: bool,
+    start_second: float,
+    end_second: float,
 ) -> list[str]:
     crop_width_expr = f"iw/{ZOOM_FACTOR}"
     crop_height_expr = f"ih/{ZOOM_FACTOR}"
 
     video_chain = (
-        f"[0:v]trim=start={START_SECOND}:end={END_SECOND},"
+        f"[0:v]trim=start={start_second}:end={end_second},"
         "setpts=PTS-STARTPTS,"
         f"scale=iw*{ZOOM_FACTOR}:ih*{ZOOM_FACTOR},"
         f"crop={crop_width_expr}:{crop_height_expr}:(in_w-out_w)/2:(in_h-out_h)/2[base];"
@@ -114,7 +171,7 @@ def build_ffmpeg_command(
 
     if include_audio:
         audio_chain = (
-            f"[0:a]atrim=start={START_SECOND}:end={END_SECOND},"
+            f"[0:a]atrim=start={start_second}:end={end_second},"
             "asetpts=PTS-STARTPTS[aout]"
         )
         filter_complex = f"{video_chain};{audio_chain}"
@@ -255,12 +312,24 @@ def main() -> int:
         input_video, logo, output_video = paths
 
         ffmpeg_binary = resolve_ffmpeg_binary()
+        ffprobe_binary = resolve_ffprobe_binary(ffmpeg_binary)
         validate_input_file(input_video, SUPPORTED_VIDEO_EXTENSIONS, "Vídeo de entrada")
         validate_input_file(logo, SUPPORTED_IMAGE_EXTENSIONS, "Logo")
         ensure_output_path(output_video)
 
+        video_duration = get_video_duration_seconds(input_video, ffprobe_binary)
+        start_second, end_second = compute_trim_window(video_duration)
+
         include_audio = has_audio_stream(input_video, ffmpeg_binary)
-        ffmpeg_cmd = build_ffmpeg_command(ffmpeg_binary, input_video, logo, output_video, include_audio)
+        ffmpeg_cmd = build_ffmpeg_command(
+            ffmpeg_binary,
+            input_video,
+            logo,
+            output_video,
+            include_audio,
+            start_second,
+            end_second,
+        )
 
         print("Executando:", " ".join(ffmpeg_cmd))
         subprocess.run(ffmpeg_cmd, check=True)
