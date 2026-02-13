@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Edição automática de vídeo com corte, zoom e marca de água.
 
-Exemplo:
+Exemplos:
     python3 main.py --input video.mp4 --logo logo.png
+    python3 main.py --gui
 """
 
 from __future__ import annotations
@@ -11,7 +12,9 @@ import argparse
 import shutil
 import subprocess
 import sys
+import tkinter as tk
 from pathlib import Path
+from tkinter import filedialog, messagebox
 
 
 START_SECOND = 5
@@ -30,12 +33,17 @@ def parse_args() -> argparse.Namespace:
             "marca de água no canto inferior direito."
         )
     )
-    parser.add_argument("--input", required=True, help="Caminho do vídeo .mp4 original")
-    parser.add_argument("--logo", required=True, help="Caminho da imagem .png da marca de água")
+    parser.add_argument("--input", help="Caminho do vídeo .mp4 original")
+    parser.add_argument("--logo", help="Caminho da imagem .png da marca de água")
     parser.add_argument(
         "--output",
         default="edited_video.mp4",
         help="Nome/caminho do vídeo editado (padrão: edited_video.mp4)",
+    )
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="Abre interface gráfica para selecionar vídeo/logo/saída.",
     )
     return parser.parse_args()
 
@@ -135,13 +143,111 @@ def ensure_output_path(output_video: Path) -> None:
     output_parent.mkdir(parents=True, exist_ok=True)
 
 
+def collect_paths_gui(default_output: str) -> tuple[str, str, str] | None:
+    selections: dict[str, str] = {}
+
+    root = tk.Tk()
+    root.title("Video Editor")
+    root.geometry("620x220")
+    root.resizable(False, False)
+
+    input_var = tk.StringVar()
+    logo_var = tk.StringVar()
+    output_var = tk.StringVar(value=default_output)
+
+    def choose_input() -> None:
+        path = filedialog.askopenfilename(
+            title="Selecionar vídeo",
+            filetypes=[("Vídeo MP4", "*.mp4")],
+        )
+        if path:
+            input_var.set(path)
+
+    def choose_logo() -> None:
+        path = filedialog.askopenfilename(
+            title="Selecionar logo",
+            filetypes=[("Imagem PNG", "*.png")],
+        )
+        if path:
+            logo_var.set(path)
+
+    def choose_output() -> None:
+        path = filedialog.asksaveasfilename(
+            title="Guardar vídeo editado",
+            defaultextension=".mp4",
+            filetypes=[("Vídeo MP4", "*.mp4")],
+            initialfile=Path(output_var.get()).name,
+        )
+        if path:
+            output_var.set(path)
+
+    def submit() -> None:
+        if not input_var.get() or not logo_var.get() or not output_var.get():
+            messagebox.showerror("Campos em falta", "Preencha os três campos antes de continuar.")
+            return
+        selections["input"] = input_var.get()
+        selections["logo"] = logo_var.get()
+        selections["output"] = output_var.get()
+        root.destroy()
+
+    def cancel() -> None:
+        root.destroy()
+
+    labels = [
+        ("Vídeo (.mp4)", input_var, choose_input),
+        ("Logo (.png)", logo_var, choose_logo),
+        ("Saída (.mp4)", output_var, choose_output),
+    ]
+
+    for row, (label, variable, callback) in enumerate(labels):
+        tk.Label(root, text=label, anchor="w").grid(row=row, column=0, padx=10, pady=10, sticky="w")
+        tk.Entry(root, textvariable=variable, width=58).grid(row=row, column=1, padx=10, pady=10)
+        tk.Button(root, text="Escolher", command=callback, width=12).grid(row=row, column=2, padx=10, pady=10)
+
+    buttons_frame = tk.Frame(root)
+    buttons_frame.grid(row=4, column=0, columnspan=3, pady=18)
+    tk.Button(buttons_frame, text="Processar", command=submit, width=16).pack(side="left", padx=10)
+    tk.Button(buttons_frame, text="Cancelar", command=cancel, width=16).pack(side="left", padx=10)
+
+    root.mainloop()
+
+    if not selections:
+        return None
+
+    return selections["input"], selections["logo"], selections["output"]
+
+
+def resolve_paths(args: argparse.Namespace) -> tuple[Path, Path, Path] | None:
+    wants_gui = args.gui or not args.input or not args.logo
+
+    if wants_gui:
+        gui_result = collect_paths_gui(args.output)
+        if gui_result is None:
+            return None
+        input_path, logo_path, output_path = gui_result
+    else:
+        input_path = args.input
+        logo_path = args.logo
+        output_path = args.output
+
+    return (
+        Path(input_path).expanduser().resolve(),
+        Path(logo_path).expanduser().resolve(),
+        Path(output_path).expanduser().resolve(),
+    )
+
+
 def main() -> int:
     args = parse_args()
-    input_video = Path(args.input).expanduser().resolve()
-    logo = Path(args.logo).expanduser().resolve()
-    output_video = Path(args.output).expanduser().resolve()
 
     try:
+        paths = resolve_paths(args)
+        if paths is None:
+            print("Operação cancelada pelo utilizador.")
+            return 1
+
+        input_video, logo, output_video = paths
+
         ensure_dependencies()
         validate_input_file(input_video, SUPPORTED_VIDEO_EXTENSIONS, "Vídeo de entrada")
         validate_input_file(logo, SUPPORTED_IMAGE_EXTENSIONS, "Logo")
