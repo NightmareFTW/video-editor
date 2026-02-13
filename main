@@ -1,1 +1,394 @@
+#!/usr/bin/env python3
+"""Aplicação GUI para edição automática de vídeos MP4 com FFmpeg."""
 
+from __future__ import annotations
+
+import shutil
+import subprocess
+import threading
+import tkinter as tk
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+
+try:
+    from PIL import Image, ImageTk
+except Exception:  # noqa: BLE001
+    Image = None
+    ImageTk = None
+
+START_SECOND = 5
+END_SECOND = 15
+ZOOM_FACTOR = 1.10
+PADDING_PX = 20
+DEFAULT_LOGO_RATIO = 0.12
+
+POSITION_EXPRESSIONS = {
+    "Canto superior esquerdo": (f"{PADDING_PX}", f"{PADDING_PX}"),
+    "Canto superior direito": (f"W-w-{PADDING_PX}", f"{PADDING_PX}"),
+    "Canto inferior esquerdo": (f"{PADDING_PX}", f"H-h-{PADDING_PX}"),
+    "Canto inferior direito": (f"W-w-{PADDING_PX}", f"H-h-{PADDING_PX}"),
+    "Centro": ("(W-w)/2", "(H-h)/2"),
+    "Centro superior": ("(W-w)/2", f"{PADDING_PX}"),
+    "Centro inferior": ("(W-w)/2", f"H-h-{PADDING_PX}"),
+    "Centro esquerdo": (f"{PADDING_PX}", "(H-h)/2"),
+    "Centro direito": (f"W-w-{PADDING_PX}", "(H-h)/2"),
+}
+
+
+class VideoEditorApp:
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self.root.title("Editor Automático de Vídeo")
+        self.root.geometry("980x730")
+
+        self.video_paths: list[Path] = []
+        self.logo_path: Path | None = None
+        self.logo_preview_image = None
+        self.preview_logo_image = None
+
+        self.output_dir_var = tk.StringVar(value=str(Path.cwd()))
+        self.logo_enabled_var = tk.BooleanVar(value=False)
+        self.logo_size_var = tk.DoubleVar(value=DEFAULT_LOGO_RATIO * 100)
+        self.position_var = tk.StringVar(value="Canto inferior direito")
+
+        self._build_ui()
+        self._update_preview()
+
+    def _build_ui(self) -> None:
+        frame = ttk.Frame(self.root, padding=14)
+        frame.pack(fill="both", expand=True)
+
+        title = ttk.Label(
+            frame,
+            text="Edição automática: corte 5–15s, zoom 110% e logo opcional",
+            font=("TkDefaultFont", 12, "bold"),
+        )
+        title.pack(anchor="w", pady=(0, 10))
+
+        videos_card = ttk.LabelFrame(frame, text="1) Selecionar vídeo(s) MP4", padding=10)
+        videos_card.pack(fill="x", pady=6)
+        ttk.Button(videos_card, text="Adicionar vídeo(s)", command=self._choose_videos).pack(side="left")
+        ttk.Button(videos_card, text="Limpar lista", command=self._clear_videos).pack(side="left", padx=8)
+
+        self.video_listbox = tk.Listbox(videos_card, height=6)
+        self.video_listbox.pack(fill="x", pady=(10, 0))
+
+        logo_card = ttk.LabelFrame(frame, text="2) Logo .png (opcional)", padding=10)
+        logo_card.pack(fill="x", pady=6)
+
+        ttk.Checkbutton(
+            logo_card,
+            text="Adicionar marca de água",
+            variable=self.logo_enabled_var,
+            command=self._update_preview,
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Button(logo_card, text="Escolher logo .png", command=self._choose_logo).grid(
+            row=0, column=1, padx=(8, 0), sticky="w"
+        )
+
+        self.logo_path_label = ttk.Label(logo_card, text="Nenhum logo selecionado")
+        self.logo_path_label.grid(row=0, column=2, padx=(10, 0), sticky="w")
+
+        ttk.Label(logo_card, text="Posição:").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        pos_combo = ttk.Combobox(
+            logo_card,
+            textvariable=self.position_var,
+            values=list(POSITION_EXPRESSIONS.keys()),
+            state="readonly",
+            width=24,
+        )
+        pos_combo.grid(row=1, column=1, sticky="w", pady=(10, 0))
+        pos_combo.bind("<<ComboboxSelected>>", lambda _: self._update_preview())
+
+        ttk.Label(logo_card, text="Tamanho do logo (% da largura do vídeo):").grid(
+            row=2, column=0, sticky="w", pady=(10, 0)
+        )
+        size_spin = ttk.Spinbox(
+            logo_card,
+            from_=5,
+            to=50,
+            increment=1,
+            textvariable=self.logo_size_var,
+            width=8,
+            command=self._update_preview,
+        )
+        size_spin.grid(row=2, column=1, sticky="w", pady=(10, 0))
+        size_spin.bind("<KeyRelease>", lambda _: self._update_preview())
+
+        output_card = ttk.LabelFrame(frame, text="3) Saída", padding=10)
+        output_card.pack(fill="x", pady=6)
+        ttk.Label(output_card, text="Pasta de saída:").pack(side="left")
+        ttk.Entry(output_card, textvariable=self.output_dir_var, width=70).pack(side="left", padx=8)
+        ttk.Button(output_card, text="Escolher pasta", command=self._choose_output_dir).pack(side="left")
+
+        preview_card = ttk.LabelFrame(frame, text="4) Preview da marca de água", padding=10)
+        preview_card.pack(fill="both", expand=True, pady=6)
+
+        self.preview_canvas = tk.Canvas(preview_card, bg="#1f1f1f", height=300, highlightthickness=0)
+        self.preview_canvas.pack(fill="both", expand=True)
+
+        run_row = ttk.Frame(frame)
+        run_row.pack(fill="x", pady=(10, 0))
+        ttk.Button(run_row, text="Processar vídeos", command=self._start_processing).pack(side="left")
+
+        self.progress = ttk.Progressbar(run_row, mode="determinate", length=300)
+        self.progress.pack(side="left", padx=12)
+
+        self.status_label = ttk.Label(run_row, text="Pronto")
+        self.status_label.pack(side="left")
+
+    def _choose_videos(self) -> None:
+        files = filedialog.askopenfilenames(
+            title="Seleciona vídeo(s) MP4",
+            filetypes=[("Vídeos MP4", "*.mp4")],
+        )
+        if not files:
+            return
+        for file in files:
+            path = Path(file)
+            if path not in self.video_paths:
+                self.video_paths.append(path)
+                self.video_listbox.insert("end", str(path))
+
+    def _clear_videos(self) -> None:
+        self.video_paths.clear()
+        self.video_listbox.delete(0, "end")
+
+    def _choose_logo(self) -> None:
+        file = filedialog.askopenfilename(
+            title="Seleciona logo PNG",
+            filetypes=[("Imagens PNG", "*.png")],
+        )
+        if not file:
+            return
+        self.logo_path = Path(file)
+        self.logo_path_label.config(text=self.logo_path.name)
+        self._load_logo_preview()
+        self._update_preview()
+
+    def _load_logo_preview(self) -> None:
+        self.logo_preview_image = None
+        if not self.logo_path:
+            return
+        if Image is None or ImageTk is None:
+            return
+        try:
+            img = Image.open(self.logo_path).convert("RGBA")
+            img.thumbnail((180, 180))
+            self.logo_preview_image = ImageTk.PhotoImage(img)
+        except Exception:  # noqa: BLE001
+            self.logo_preview_image = None
+
+    def _choose_output_dir(self) -> None:
+        directory = filedialog.askdirectory(title="Seleciona pasta de saída")
+        if directory:
+            self.output_dir_var.set(directory)
+
+    def _overlay_preview_coords(self, frame_w: int, frame_h: int, logo_w: int, logo_h: int) -> tuple[int, int]:
+        position = self.position_var.get()
+        if "superior" in position and "Centro" not in position:
+            y = PADDING_PX
+        elif "inferior" in position and "Centro" not in position:
+            y = frame_h - logo_h - PADDING_PX
+        elif "superior" in position:
+            y = PADDING_PX
+        elif "inferior" in position:
+            y = frame_h - logo_h - PADDING_PX
+        else:
+            y = (frame_h - logo_h) // 2
+
+        if "esquerdo" in position:
+            x = PADDING_PX
+        elif "direito" in position:
+            x = frame_w - logo_w - PADDING_PX
+        else:
+            x = (frame_w - logo_w) // 2
+
+        x = max(0, min(frame_w - logo_w, x))
+        y = max(0, min(frame_h - logo_h, y))
+        return x, y
+
+    def _update_preview(self) -> None:
+        self.preview_canvas.delete("all")
+        canvas_w = max(self.preview_canvas.winfo_width(), 640)
+        canvas_h = max(self.preview_canvas.winfo_height(), 300)
+
+        frame_w = int(canvas_w * 0.85)
+        frame_h = int(frame_w * 9 / 16)
+        if frame_h > canvas_h - 20:
+            frame_h = canvas_h - 20
+            frame_w = int(frame_h * 16 / 9)
+
+        fx = (canvas_w - frame_w) // 2
+        fy = (canvas_h - frame_h) // 2
+        self.preview_canvas.create_rectangle(fx, fy, fx + frame_w, fy + frame_h, fill="#343434", outline="#777")
+        self.preview_canvas.create_text(fx + 12, fy + 14, text="Frame final (preview)", fill="#ddd", anchor="w")
+
+        if self.logo_enabled_var.get() and self.logo_path:
+            ratio = max(5, min(50, self.logo_size_var.get())) / 100.0
+            logo_w = int(frame_w * ratio)
+            logo_h = max(24, int(logo_w * 0.35))
+            lx, ly = self._overlay_preview_coords(frame_w, frame_h, logo_w, logo_h)
+            x1, y1 = fx + lx, fy + ly
+            x2, y2 = x1 + logo_w, y1 + logo_h
+
+            if self.logo_preview_image is not None and Image is not None and ImageTk is not None:
+                try:
+                    raw = Image.open(self.logo_path).convert("RGBA")
+                    raw.thumbnail((logo_w, logo_h))
+                    self.preview_logo_image = ImageTk.PhotoImage(raw)
+                    self.preview_canvas.create_image(x1, y1, image=self.preview_logo_image, anchor="nw")
+                except Exception:  # noqa: BLE001
+                    self.preview_canvas.create_rectangle(x1, y1, x2, y2, fill="#00a2ff", outline="")
+            else:
+                self.preview_canvas.create_rectangle(x1, y1, x2, y2, fill="#00a2ff", outline="")
+                self.preview_canvas.create_text((x1 + x2) // 2, (y1 + y2) // 2, text="LOGO", fill="white")
+
+        self.preview_canvas.create_text(
+            canvas_w // 2,
+            canvas_h - 8,
+            text="O preview representa posição/tamanho aproximados da marca de água.",
+            fill="#cfcfcf",
+            anchor="s",
+        )
+
+    def _validate(self) -> str | None:
+        if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+            return "ffmpeg/ffprobe não encontrados no sistema."
+        if not self.video_paths:
+            return "Seleciona pelo menos um vídeo MP4."
+        for video in self.video_paths:
+            if not video.exists() or video.suffix.lower() != ".mp4":
+                return f"Vídeo inválido: {video}"
+        if self.logo_enabled_var.get():
+            if self.logo_path is None:
+                return "Ativaste logo, mas não selecionaste nenhum arquivo PNG."
+            if self.logo_path.suffix.lower() != ".png":
+                return "O logo deve ser um arquivo .png"
+        output_dir = Path(self.output_dir_var.get()).expanduser()
+        if not output_dir.exists():
+            return f"Pasta de saída não existe: {output_dir}"
+        return None
+
+    def _start_processing(self) -> None:
+        error = self._validate()
+        if error:
+            messagebox.showerror("Validação", error)
+            return
+
+        self.progress.configure(maximum=len(self.video_paths), value=0)
+        self.status_label.config(text="A processar...")
+
+        worker = threading.Thread(target=self._process_all_videos, daemon=True)
+        worker.start()
+
+    def _process_all_videos(self) -> None:
+        output_dir = Path(self.output_dir_var.get()).expanduser().resolve()
+        logo_ratio = max(5, min(50, self.logo_size_var.get())) / 100.0
+
+        failures: list[str] = []
+        for index, input_video in enumerate(self.video_paths, start=1):
+            out_name = f"{input_video.stem}_edited.mp4"
+            output_video = output_dir / out_name
+            try:
+                include_audio = has_audio_stream(input_video)
+                cmd = build_ffmpeg_command(
+                    input_video=input_video,
+                    output_video=output_video,
+                    include_audio=include_audio,
+                    logo_path=self.logo_path if self.logo_enabled_var.get() else None,
+                    logo_ratio=logo_ratio,
+                    overlay_position=self.position_var.get(),
+                )
+                subprocess.run(cmd, check=True, capture_output=True, text=True)
+            except Exception as exc:  # noqa: BLE001
+                failures.append(f"{input_video.name}: {exc}")
+
+            self.root.after(0, self._update_progress, index, len(self.video_paths), input_video.name)
+
+        self.root.after(0, self._finish_processing, failures)
+
+    def _update_progress(self, value: int, total: int, filename: str) -> None:
+        self.progress.configure(value=value)
+        self.status_label.config(text=f"{value}/{total}: {filename}")
+
+    def _finish_processing(self, failures: list[str]) -> None:
+        if failures:
+            messagebox.showwarning(
+                "Concluído com erros",
+                "Alguns vídeos falharam:\n\n" + "\n".join(failures[:10]),
+            )
+            self.status_label.config(text="Concluído com erros")
+        else:
+            messagebox.showinfo("Sucesso", "Todos os vídeos foram processados com sucesso.")
+            self.status_label.config(text="Concluído")
+
+
+def has_audio_stream(video_path: Path) -> bool:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "a",
+        "-show_entries",
+        "stream=index",
+        "-of",
+        "csv=p=0",
+        str(video_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    return bool(result.stdout.strip())
+
+
+def build_ffmpeg_command(
+    input_video: Path,
+    output_video: Path,
+    include_audio: bool,
+    logo_path: Path | None,
+    logo_ratio: float,
+    overlay_position: str,
+) -> list[str]:
+    crop_width_expr = f"iw/{ZOOM_FACTOR}"
+    crop_height_expr = f"ih/{ZOOM_FACTOR}"
+
+    chain = (
+        f"[0:v]trim=start={START_SECOND}:end={END_SECOND},"
+        "setpts=PTS-STARTPTS,"
+        f"scale=iw*{ZOOM_FACTOR}:ih*{ZOOM_FACTOR},"
+        f"crop={crop_width_expr}:{crop_height_expr}:(in_w-out_w)/2:(in_h-out_h)/2[base]"
+    )
+
+    inputs = ["ffmpeg", "-y", "-i", str(input_video)]
+    vmap = "[base]"
+
+    if logo_path is not None:
+        inputs += ["-i", str(logo_path)]
+        ox, oy = POSITION_EXPRESSIONS.get(overlay_position, POSITION_EXPRESSIONS["Canto inferior direito"])
+        chain += (
+            f";[1:v][base]scale2ref=w=main_w*{logo_ratio}:h=-1[wm][base2]"
+            f";[base2][wm]overlay={ox}:{oy}[vout]"
+        )
+        vmap = "[vout]"
+
+    if include_audio:
+        chain += f";[0:a]atrim=start={START_SECOND}:end={END_SECOND},asetpts=PTS-STARTPTS[aout]"
+
+    cmd = inputs + ["-filter_complex", chain, "-map", vmap]
+    if include_audio:
+        cmd += ["-map", "[aout]", "-c:a", "aac"]
+
+    cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p", str(output_video)]
+    return cmd
+
+
+def main() -> int:
+    root = tk.Tk()
+    app = VideoEditorApp(root)
+    root.bind("<Configure>", lambda _: app._update_preview())
+    root.mainloop()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
