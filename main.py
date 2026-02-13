@@ -9,6 +9,7 @@ Exemplos:
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import subprocess
 import sys
@@ -48,11 +49,20 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def ensure_dependencies() -> None:
-    if shutil.which("ffmpeg") is None:
-        raise RuntimeError("ffmpeg não encontrado no sistema.")
-    if shutil.which("ffprobe") is None:
-        raise RuntimeError("ffprobe não encontrado no sistema.")
+def resolve_ffmpeg_binary() -> str:
+    ffmpeg_in_path = shutil.which("ffmpeg")
+    if ffmpeg_in_path:
+        return ffmpeg_in_path
+
+    try:
+        import imageio_ffmpeg  # type: ignore
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:  # noqa: BLE001
+        raise RuntimeError(
+            "ffmpeg não encontrado no sistema. Instale o FFmpeg e adicione ao PATH "
+            "(no Windows, prefira winget/choco/scoop) ou instale `imageio-ffmpeg` via pip."
+        )
 
 
 def validate_input_file(path: Path, valid_extensions: set[str], label: str) -> None:
@@ -65,24 +75,20 @@ def validate_input_file(path: Path, valid_extensions: set[str], label: str) -> N
         raise ValueError(f"{label} deve ter uma destas extensões: {allowed}")
 
 
-def has_audio_stream(video_path: Path) -> bool:
-    cmd = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-select_streams",
-        "a",
-        "-show_entries",
-        "stream=index",
-        "-of",
-        "csv=p=0",
-        str(video_path),
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    return bool(result.stdout.strip())
+def has_audio_stream(video_path: Path, ffmpeg_binary: str) -> bool:
+    cmd = [ffmpeg_binary, "-i", str(video_path)]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    combined_output = f"{result.stdout}\n{result.stderr}"
+    return re.search(r"Stream #\d+:\d+.*Audio:", combined_output) is not None
 
 
-def build_ffmpeg_command(input_video: Path, logo: Path, output_video: Path, include_audio: bool) -> list[str]:
+def build_ffmpeg_command(
+    ffmpeg_binary: str,
+    input_video: Path,
+    logo: Path,
+    output_video: Path,
+    include_audio: bool,
+) -> list[str]:
     crop_width_expr = f"iw/{ZOOM_FACTOR}"
     crop_height_expr = f"ih/{ZOOM_FACTOR}"
 
@@ -98,7 +104,7 @@ def build_ffmpeg_command(input_video: Path, logo: Path, output_video: Path, incl
     filter_complex = video_chain
 
     command = [
-        "ffmpeg",
+        ffmpeg_binary,
         "-y",
         "-i",
         str(input_video),
@@ -248,13 +254,13 @@ def main() -> int:
 
         input_video, logo, output_video = paths
 
-        ensure_dependencies()
+        ffmpeg_binary = resolve_ffmpeg_binary()
         validate_input_file(input_video, SUPPORTED_VIDEO_EXTENSIONS, "Vídeo de entrada")
         validate_input_file(logo, SUPPORTED_IMAGE_EXTENSIONS, "Logo")
         ensure_output_path(output_video)
 
-        include_audio = has_audio_stream(input_video)
-        ffmpeg_cmd = build_ffmpeg_command(input_video, logo, output_video, include_audio)
+        include_audio = has_audio_stream(input_video, ffmpeg_binary)
+        ffmpeg_cmd = build_ffmpeg_command(ffmpeg_binary, input_video, logo, output_video, include_audio)
 
         print("Executando:", " ".join(ffmpeg_cmd))
         subprocess.run(ffmpeg_cmd, check=True)
