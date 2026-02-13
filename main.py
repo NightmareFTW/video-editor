@@ -156,6 +156,14 @@ def compute_trim_window(video_duration_seconds: float) -> tuple[float, float]:
         raise RuntimeError("A duração do vídeo é inválida (<= 0).")
 
     return 0.0, video_duration_seconds
+    start = min(START_SECOND, max(video_duration_seconds - 0.001, 0.0))
+    end = min(END_SECOND, video_duration_seconds)
+
+    if end <= start:
+        start = 0.0
+        end = video_duration_seconds
+
+    return start, end
 
 
 def build_ffmpeg_command(
@@ -172,6 +180,9 @@ def build_ffmpeg_command(
 
     video_chain = (
         f"[0:v]scale=iw*{ZOOM_FACTOR}:ih*{ZOOM_FACTOR},"
+        f"[0:v]trim=start={start_second}:end={end_second},"
+        "setpts=PTS-STARTPTS,"
+        f"scale=iw*{ZOOM_FACTOR}:ih*{ZOOM_FACTOR},"
         f"crop={crop_width_expr}:{crop_height_expr}:(in_w-out_w)/2:(in_h-out_h)/2[base];"
         f"[1:v][base]scale2ref=w=main_w*{WATERMARK_WIDTH_RATIO}:h=-1[wm][base2];"
         f"[base2][wm]overlay=W-w-{PADDING_PX}:H-h-{PADDING_PX}[vout]"
@@ -196,6 +207,11 @@ def build_ffmpeg_command(
 
     if include_audio:
         filter_complex = f"{video_chain};[0:a]asetpts=PTS-STARTPTS[aout]"
+        audio_chain = (
+            f"[0:a]atrim=start={start_second}:end={end_second},"
+            "asetpts=PTS-STARTPTS[aout]"
+        )
+        filter_complex = f"{video_chain};{audio_chain}"
 
     command += [
         "-filter_complex",
