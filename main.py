@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """Edição automática de vídeo com corte, zoom e marca de água.
 
-Exemplo:
+Exemplos:
     python3 main.py --input video.mp4 --logo logo.png
+    python3 main.py --gui
 """
 
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import subprocess
 import sys
+import tkinter as tk
 from pathlib import Path
+from tkinter import filedialog, messagebox
 
 
 START_SECOND = 5
@@ -30,21 +34,35 @@ def parse_args() -> argparse.Namespace:
             "marca de água no canto inferior direito."
         )
     )
-    parser.add_argument("--input", required=True, help="Caminho do vídeo .mp4 original")
-    parser.add_argument("--logo", required=True, help="Caminho da imagem .png da marca de água")
+    parser.add_argument("--input", help="Caminho do vídeo .mp4 original")
+    parser.add_argument("--logo", help="Caminho da imagem .png da marca de água")
     parser.add_argument(
         "--output",
         default="edited_video.mp4",
         help="Nome/caminho do vídeo editado (padrão: edited_video.mp4)",
     )
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="Abre interface gráfica para selecionar vídeo/logo/saída.",
+    )
     return parser.parse_args()
 
 
-def ensure_dependencies() -> None:
-    if shutil.which("ffmpeg") is None:
-        raise RuntimeError("ffmpeg não encontrado no sistema.")
-    if shutil.which("ffprobe") is None:
-        raise RuntimeError("ffprobe não encontrado no sistema.")
+def resolve_ffmpeg_binary() -> str:
+    ffmpeg_in_path = shutil.which("ffmpeg")
+    if ffmpeg_in_path:
+        return ffmpeg_in_path
+
+    try:
+        import imageio_ffmpeg  # type: ignore
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:  # noqa: BLE001
+        raise RuntimeError(
+            "ffmpeg não encontrado no sistema. Instale o FFmpeg e adicione ao PATH "
+            "(no Windows, prefira winget/choco/scoop) ou instale `imageio-ffmpeg` via pip."
+        )
 
 
 def validate_input_file(path: Path, valid_extensions: set[str], label: str) -> None:
@@ -57,24 +75,20 @@ def validate_input_file(path: Path, valid_extensions: set[str], label: str) -> N
         raise ValueError(f"{label} deve ter uma destas extensões: {allowed}")
 
 
-def has_audio_stream(video_path: Path) -> bool:
-    cmd = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-select_streams",
-        "a",
-        "-show_entries",
-        "stream=index",
-        "-of",
-        "csv=p=0",
-        str(video_path),
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    return bool(result.stdout.strip())
+def has_audio_stream(video_path: Path, ffmpeg_binary: str) -> bool:
+    cmd = [ffmpeg_binary, "-i", str(video_path)]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    combined_output = f"{result.stdout}\n{result.stderr}"
+    return re.search(r"Stream #\d+:\d+.*Audio:", combined_output) is not None
 
 
-def build_ffmpeg_command(input_video: Path, logo: Path, output_video: Path, include_audio: bool) -> list[str]:
+def build_ffmpeg_command(
+    ffmpeg_binary: str,
+    input_video: Path,
+    logo: Path,
+    output_video: Path,
+    include_audio: bool,
+) -> list[str]:
     crop_width_expr = f"iw/{ZOOM_FACTOR}"
     crop_height_expr = f"ih/{ZOOM_FACTOR}"
 
@@ -90,7 +104,7 @@ def build_ffmpeg_command(input_video: Path, logo: Path, output_video: Path, incl
     filter_complex = video_chain
 
     command = [
-        "ffmpeg",
+        ffmpeg_binary,
         "-y",
         "-i",
         str(input_video),
@@ -135,20 +149,118 @@ def ensure_output_path(output_video: Path) -> None:
     output_parent.mkdir(parents=True, exist_ok=True)
 
 
+def collect_paths_gui(default_output: str) -> tuple[str, str, str] | None:
+    selections: dict[str, str] = {}
+
+    root = tk.Tk()
+    root.title("Video Editor")
+    root.geometry("620x220")
+    root.resizable(False, False)
+
+    input_var = tk.StringVar()
+    logo_var = tk.StringVar()
+    output_var = tk.StringVar(value=default_output)
+
+    def choose_input() -> None:
+        path = filedialog.askopenfilename(
+            title="Selecionar vídeo",
+            filetypes=[("Vídeo MP4", "*.mp4")],
+        )
+        if path:
+            input_var.set(path)
+
+    def choose_logo() -> None:
+        path = filedialog.askopenfilename(
+            title="Selecionar logo",
+            filetypes=[("Imagem PNG", "*.png")],
+        )
+        if path:
+            logo_var.set(path)
+
+    def choose_output() -> None:
+        path = filedialog.asksaveasfilename(
+            title="Guardar vídeo editado",
+            defaultextension=".mp4",
+            filetypes=[("Vídeo MP4", "*.mp4")],
+            initialfile=Path(output_var.get()).name,
+        )
+        if path:
+            output_var.set(path)
+
+    def submit() -> None:
+        if not input_var.get() or not logo_var.get() or not output_var.get():
+            messagebox.showerror("Campos em falta", "Preencha os três campos antes de continuar.")
+            return
+        selections["input"] = input_var.get()
+        selections["logo"] = logo_var.get()
+        selections["output"] = output_var.get()
+        root.destroy()
+
+    def cancel() -> None:
+        root.destroy()
+
+    labels = [
+        ("Vídeo (.mp4)", input_var, choose_input),
+        ("Logo (.png)", logo_var, choose_logo),
+        ("Saída (.mp4)", output_var, choose_output),
+    ]
+
+    for row, (label, variable, callback) in enumerate(labels):
+        tk.Label(root, text=label, anchor="w").grid(row=row, column=0, padx=10, pady=10, sticky="w")
+        tk.Entry(root, textvariable=variable, width=58).grid(row=row, column=1, padx=10, pady=10)
+        tk.Button(root, text="Escolher", command=callback, width=12).grid(row=row, column=2, padx=10, pady=10)
+
+    buttons_frame = tk.Frame(root)
+    buttons_frame.grid(row=4, column=0, columnspan=3, pady=18)
+    tk.Button(buttons_frame, text="Processar", command=submit, width=16).pack(side="left", padx=10)
+    tk.Button(buttons_frame, text="Cancelar", command=cancel, width=16).pack(side="left", padx=10)
+
+    root.mainloop()
+
+    if not selections:
+        return None
+
+    return selections["input"], selections["logo"], selections["output"]
+
+
+def resolve_paths(args: argparse.Namespace) -> tuple[Path, Path, Path] | None:
+    wants_gui = args.gui or not args.input or not args.logo
+
+    if wants_gui:
+        gui_result = collect_paths_gui(args.output)
+        if gui_result is None:
+            return None
+        input_path, logo_path, output_path = gui_result
+    else:
+        input_path = args.input
+        logo_path = args.logo
+        output_path = args.output
+
+    return (
+        Path(input_path).expanduser().resolve(),
+        Path(logo_path).expanduser().resolve(),
+        Path(output_path).expanduser().resolve(),
+    )
+
+
 def main() -> int:
     args = parse_args()
-    input_video = Path(args.input).expanduser().resolve()
-    logo = Path(args.logo).expanduser().resolve()
-    output_video = Path(args.output).expanduser().resolve()
 
     try:
-        ensure_dependencies()
+        paths = resolve_paths(args)
+        if paths is None:
+            print("Operação cancelada pelo utilizador.")
+            return 1
+
+        input_video, logo, output_video = paths
+
+        ffmpeg_binary = resolve_ffmpeg_binary()
         validate_input_file(input_video, SUPPORTED_VIDEO_EXTENSIONS, "Vídeo de entrada")
         validate_input_file(logo, SUPPORTED_IMAGE_EXTENSIONS, "Logo")
         ensure_output_path(output_video)
 
-        include_audio = has_audio_stream(input_video)
-        ffmpeg_cmd = build_ffmpeg_command(input_video, logo, output_video, include_audio)
+        include_audio = has_audio_stream(input_video, ffmpeg_binary)
+        ffmpeg_cmd = build_ffmpeg_command(ffmpeg_binary, input_video, logo, output_video, include_audio)
 
         print("Executando:", " ".join(ffmpeg_cmd))
         subprocess.run(ffmpeg_cmd, check=True)
