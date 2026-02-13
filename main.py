@@ -177,6 +177,7 @@ def build_ffmpeg_command(
     crop_height_expr = f"ih/{ZOOM_FACTOR}"
 
     video_chain = (
+        f"[0:v]scale=iw*{ZOOM_FACTOR}:ih*{ZOOM_FACTOR},"
         f"[0:v]trim=start={start_second}:end={end_second},"
         "setpts=PTS-STARTPTS,"
         f"scale=iw*{ZOOM_FACTOR}:ih*{ZOOM_FACTOR},"
@@ -190,13 +191,20 @@ def build_ffmpeg_command(
     command = [
         ffmpeg_binary,
         "-y",
+        "-ss",
+        f"{start_second:.3f}",
+        "-to",
+        f"{end_second:.3f}",
         "-i",
         str(input_video),
+        "-loop",
+        "1",
         "-i",
         str(logo),
     ]
 
     if include_audio:
+        filter_complex = f"{video_chain};[0:a]asetpts=PTS-STARTPTS[aout]"
         audio_chain = (
             f"[0:a]atrim=start={start_second}:end={end_second},"
             "asetpts=PTS-STARTPTS[aout]"
@@ -218,6 +226,7 @@ def build_ffmpeg_command(
         "libx264",
         "-pix_fmt",
         "yuv420p",
+        "-shortest",
         "-movflags",
         "+faststart",
         str(output_video),
