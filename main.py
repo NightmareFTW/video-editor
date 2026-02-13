@@ -83,7 +83,7 @@ def has_audio_stream(video_path: Path, ffmpeg_binary: str) -> bool:
     return re.search(r"Stream #\d+:\d+.*Audio:", combined_output) is not None
 
 
-def resolve_ffprobe_binary(ffmpeg_binary: str) -> str:
+def resolve_ffprobe_binary(ffmpeg_binary: str) -> str | None:
     ffprobe_in_path = shutil.which("ffprobe")
     if ffprobe_in_path:
         return ffprobe_in_path
@@ -98,31 +98,58 @@ def resolve_ffprobe_binary(ffmpeg_binary: str) -> str:
         if sibling_ffprobe_with_suffix.exists():
             return str(sibling_ffprobe_with_suffix)
 
-    raise RuntimeError("ffprobe não encontrado. Instale FFmpeg completo (ffmpeg + ffprobe).")
+    return None
 
 
-def get_video_duration_seconds(video_path: Path, ffprobe_binary: str) -> float:
-    cmd = [
-        ffprobe_binary,
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "json",
-        str(video_path),
-    ]
+def parse_duration_from_ffmpeg_probe_output(output: str) -> float | None:
+    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", output)
+    if not match:
+        return None
 
-    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    payload = json.loads(result.stdout or "{}")
-    duration_raw = payload.get("format", {}).get("duration")
+    hours = int(match.group(1))
+    minutes = int(match.group(2))
+    seconds = float(match.group(3))
+    duration = hours * 3600 + minutes * 60 + seconds
+    return duration if duration > 0 else None
 
-    if duration_raw is None:
-        raise RuntimeError("Não foi possível obter a duração do vídeo de entrada.")
 
-    duration = float(duration_raw)
-    if duration <= 0:
-        raise RuntimeError("A duração do vídeo é inválida (<= 0).")
+def get_video_duration_seconds(
+    video_path: Path,
+    ffmpeg_binary: str,
+    ffprobe_binary: str | None,
+) -> float:
+    duration: float | None = None
+
+    if ffprobe_binary:
+        cmd = [
+            ffprobe_binary,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "json",
+            str(video_path),
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if result.returncode == 0:
+            payload = json.loads(result.stdout or "{}")
+            duration_raw = payload.get("format", {}).get("duration")
+            if duration_raw is not None:
+                duration = float(duration_raw)
+
+    if duration is None:
+        fallback_cmd = [ffmpeg_binary, "-i", str(video_path)]
+        fallback_result = subprocess.run(fallback_cmd, capture_output=True, text=True, check=False)
+        combined_output = f"{fallback_result.stdout}\n{fallback_result.stderr}"
+        duration = parse_duration_from_ffmpeg_probe_output(combined_output)
+
+    if duration is None or duration <= 0:
+        raise RuntimeError(
+            "Não foi possível obter a duração do vídeo. Verifique se o ficheiro não está corrompido."
+        )
+
     return duration
 
 
@@ -313,11 +340,13 @@ def main() -> int:
 
         ffmpeg_binary = resolve_ffmpeg_binary()
         ffprobe_binary = resolve_ffprobe_binary(ffmpeg_binary)
+        if ffprobe_binary is None:
+            print("⚠️ ffprobe não encontrado; a usar fallback de duração via ffmpeg.")
         validate_input_file(input_video, SUPPORTED_VIDEO_EXTENSIONS, "Vídeo de entrada")
         validate_input_file(logo, SUPPORTED_IMAGE_EXTENSIONS, "Logo")
         ensure_output_path(output_video)
 
-        video_duration = get_video_duration_seconds(input_video, ffprobe_binary)
+        video_duration = get_video_duration_seconds(input_video, ffmpeg_binary, ffprobe_binary)
         start_second, end_second = compute_trim_window(video_duration)
 
         include_audio = has_audio_stream(input_video, ffmpeg_binary)
