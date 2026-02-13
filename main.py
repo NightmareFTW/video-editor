@@ -2,7 +2,7 @@
 """Edição automática de vídeo com corte, zoom e marca de água.
 
 Exemplo:
-    python3 main --input video.mp4 --logo logo.png
+    python3 main.py --input video.mp4 --logo logo.png
 """
 
 from __future__ import annotations
@@ -19,6 +19,8 @@ END_SECOND = 15
 ZOOM_FACTOR = 1.10
 WATERMARK_WIDTH_RATIO = 0.12
 PADDING_PX = 20
+SUPPORTED_VIDEO_EXTENSIONS = {".mp4"}
+SUPPORTED_IMAGE_EXTENSIONS = {".png"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,6 +45,16 @@ def ensure_dependencies() -> None:
         raise RuntimeError("ffmpeg não encontrado no sistema.")
     if shutil.which("ffprobe") is None:
         raise RuntimeError("ffprobe não encontrado no sistema.")
+
+
+def validate_input_file(path: Path, valid_extensions: set[str], label: str) -> None:
+    if not path.exists():
+        raise FileNotFoundError(f"{label} não encontrado: {path}")
+    if not path.is_file():
+        raise ValueError(f"{label} inválido (não é ficheiro): {path}")
+    if path.suffix.lower() not in valid_extensions:
+        allowed = ", ".join(sorted(valid_extensions))
+        raise ValueError(f"{label} deve ter uma destas extensões: {allowed}")
 
 
 def has_audio_stream(video_path: Path) -> bool:
@@ -108,9 +120,19 @@ def build_ffmpeg_command(input_video: Path, logo: Path, output_video: Path, incl
         "libx264",
         "-pix_fmt",
         "yuv420p",
+        "-movflags",
+        "+faststart",
         str(output_video),
     ]
     return command
+
+
+def ensure_output_path(output_video: Path) -> None:
+    if output_video.suffix.lower() != ".mp4":
+        raise ValueError("O ficheiro de saída deve ter extensão .mp4")
+
+    output_parent = output_video.parent
+    output_parent.mkdir(parents=True, exist_ok=True)
 
 
 def main() -> int:
@@ -121,15 +143,9 @@ def main() -> int:
 
     try:
         ensure_dependencies()
-
-        if not input_video.exists():
-            raise FileNotFoundError(f"Vídeo de entrada não encontrado: {input_video}")
-        if input_video.suffix.lower() != ".mp4":
-            raise ValueError("O vídeo de entrada deve ser um arquivo .mp4")
-        if not logo.exists():
-            raise FileNotFoundError(f"Logo não encontrado: {logo}")
-        if logo.suffix.lower() != ".png":
-            raise ValueError("A marca de água deve ser um arquivo .png")
+        validate_input_file(input_video, SUPPORTED_VIDEO_EXTENSIONS, "Vídeo de entrada")
+        validate_input_file(logo, SUPPORTED_IMAGE_EXTENSIONS, "Logo")
+        ensure_output_path(output_video)
 
         include_audio = has_audio_stream(input_video)
         ffmpeg_cmd = build_ffmpeg_command(input_video, logo, output_video, include_audio)
@@ -144,6 +160,8 @@ def main() -> int:
         return 0
     except subprocess.CalledProcessError as exc:
         print(f"❌ Falha ao processar vídeo. Código: {exc.returncode}", file=sys.stderr)
+        if exc.stderr:
+            print(exc.stderr, file=sys.stderr)
         return exc.returncode
     except Exception as exc:  # noqa: BLE001
         print(f"❌ Erro: {exc}", file=sys.stderr)
