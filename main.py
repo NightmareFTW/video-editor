@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Edição automática de vídeo com corte, zoom e marca de água.
+"""Edição automática de vídeo com zoom e marca de água.
 
 Exemplos:
     python3 main.py --input video.mp4 --logo logo.png
@@ -19,8 +19,6 @@ from pathlib import Path
 from tkinter import filedialog, messagebox
 
 
-START_SECOND = 5
-END_SECOND = 15
 ZOOM_FACTOR = 1.10
 WATERMARK_WIDTH_RATIO = 0.12
 PADDING_PX = 20
@@ -31,7 +29,7 @@ SUPPORTED_IMAGE_EXTENSIONS = {".png"}
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Recorta o vídeo entre 5s e 15s, aplica zoom de 110% e adiciona "
+            "Processa o vídeo completo, aplica zoom de 110% e adiciona "
             "marca de água no canto inferior direito."
         )
     )
@@ -154,6 +152,10 @@ def get_video_duration_seconds(
 
 
 def compute_trim_window(video_duration_seconds: float) -> tuple[float, float]:
+    if video_duration_seconds <= 0:
+        raise RuntimeError("A duração do vídeo é inválida (<= 0).")
+
+    return 0.0, video_duration_seconds
     start = min(START_SECOND, max(video_duration_seconds - 0.001, 0.0))
     end = min(END_SECOND, video_duration_seconds)
 
